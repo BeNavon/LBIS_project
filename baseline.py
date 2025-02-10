@@ -3,37 +3,81 @@ import glob
 import numpy as np
 import scipy.io as sio
 import torch
-import torch.nn as nn
-import torch.nn.functional as F
-from torch.utils.data import Dataset, DataLoader
+from torch.utils.data import Dataset
 import random
+import pandas as pd  # needed for _load_as_text below
 
-###############################################################################
-# 1. Custom Dataset Class
-###############################################################################
+def _load_as_text(file_path):
+    """
+    Fallback function to load a file as a text table using pandas.
+    
+    This function uses a regex separator (splitting on one or more tabs or commas),
+    skips the header row, and uses on_bad_lines='skip' to ignore malformed lines.
+    It first attempts to read with UTF-8 encoding; if that fails, it falls back to latin1.
+    After reading, it converts all columns to numeric (non-numeric values become NaN)
+    and fills missing values before converting to a float32 NumPy array.
+    """
+    try:
+        # Attempt with UTF-8 encoding.
+        df = pd.read_csv(
+            file_path,
+            sep=r'[\t,]+',
+            engine='python',
+            skiprows=1,      # Skip header row
+            header=None,
+            encoding='utf-8',
+            on_bad_lines='skip'
+        )
+    except UnicodeDecodeError as e:
+        print(f"Unicode decode error for {file_path} with utf-8: {e}. Trying latin1 encoding.")
+        try:
+            df = pd.read_csv(
+                file_path,
+                sep=r'[\t,]+',
+                engine='python',
+                skiprows=1,
+                header=None,
+                encoding='latin1',
+                on_bad_lines='skip'
+            )
+        except Exception as e2:
+            raise ValueError(f"Failed to load {file_path} as text with pandas using latin1: {e2}")
+    except Exception as e:
+        raise ValueError(f"Failed to load {file_path} as text with pandas: {e}")
+    
+    # Convert every column to numeric, coercing errors to NaN.
+    df = df.apply(pd.to_numeric, errors='coerce')
+    # Replace NaN values with 0 (or another appropriate value).
+    df = df.fillna(0)
+    
+    try:
+        data = df.to_numpy(dtype=np.float32)
+    except Exception as e:
+        raise ValueError(f"Could not convert data from {file_path} to float32: {e}")
+    
+    return data
+
 
 class InertialDataset(Dataset):
-    def __init__(self, root_dir, sensor='imu', 
-                 sequence_length=128, 
-                 mode_filter=None,
-                 transform=None):
+    def __init__(self, root_dir, sensor='imu', sequence_length=128,
+                 mode_filter=None, transform=None, expected_channels=None):
         """
         Args:
-            root_dir (str): Path to the root directory containing subject folders.
-            sensor (str): Sensor name to load (e.g., 'imu'). The code assumes that
-                          files for this sensor are stored in 
-                          <subject>/<date>/<mode>/<sensor>/*.mat.
-            sequence_length (int): Number of time steps to extract per sample.
-            mode_filter (list or None): Optionally, a list of locomotion modes to include.
-                (e.g. ['treadmill', 'ramp']). If None, all modes are included.
-            transform (callable, optional): Optional transform to be applied on a sample.
+            root_dir (str): Root folder (e.g., "dataset").
+            sensor (str): Sensor name (e.g., 'imu').
+            sequence_length (int): Number of time steps per sample.
+            mode_filter (list or None): List of locomotion modes to include (e.g. ["levelground"]).
+            transform (callable, optional): Optional transform to apply.
+            expected_channels (int, optional): Force all returned samples to have this many channels.
+                If a sample has fewer columns, it is padded with zeros; if more, it is trimmed.
         """
         self.root_dir = root_dir
         self.sensor = sensor
         self.sequence_length = sequence_length
         self.transform = transform
+        self.expected_channels = expected_channels  # e.g., 4 or 24
         
-        # Define the mapping from locomotion mode to label.
+        # Mapping for locomotion mode labels.
         self.mode_mapping = {
             'treadmill': 0,
             'levelground': 1,
@@ -42,13 +86,17 @@ class InertialDataset(Dataset):
             'static': 4
         }
         
-        # Use glob to search for all .mat files for the given sensor.
-        # Assumes file structure: <root_dir>/<subject>/<date>/<mode>/<sensor>/*.mat
-        search_path = os.path.join(self.root_dir, '*', '*', '*', self.sensor, '*.mat')
-        self.file_list = glob.glob(search_path, recursive=True)
+        # Search for files: dataset/AB*/<date>/levelground/<sensor>/*.mat
+        search_path = os.path.join(self.root_dir, "AB*", "*", "levelground", self.sensor, "*.mat")
+        all_files = glob.glob(search_path, recursive=True)
+        
+        # Exclude files from any "osimxml" folder.
+        self.file_list = [f for f in all_files if "osimxml" not in f.lower()]
+        
+        # Apply mode filter if provided.
         if mode_filter is not None:
             self.file_list = [f for f in self.file_list if self._get_mode_from_path(f) in mode_filter]
-            
+        
         if len(self.file_list) == 0:
             raise RuntimeError(f'No files found with sensor "{self.sensor}" in {self.root_dir}!')
             
@@ -56,37 +104,31 @@ class InertialDataset(Dataset):
         return len(self.file_list)
     
     def __getitem__(self, idx):
-        # Get file path and extract label (locomotion mode) from folder structure.
         file_path = self.file_list[idx]
         mode = self._get_mode_from_path(file_path)
         try:
             label = self.mode_mapping[mode]
         except KeyError:
             raise ValueError(f"Unknown mode '{mode}' found in path: {file_path}")
-
-        # Load sensor data from the .mat file.
+        
+        # Load sensor data.
         data = self._load_mat_file(file_path)
         
-        # (Optional) You may want to apply additional synchronization here using the
-        # timestamp information if you plan to combine sensors.
+        # Enforce fixed channel dimension if expected_channels is set.
+        if self.expected_channels is not None:
+            current_channels = data.shape[1]
+            if current_channels < self.expected_channels:
+                pad_width = self.expected_channels - current_channels
+                data = np.pad(data, ((0, 0), (0, pad_width)), mode='constant')
+            elif current_channels > self.expected_channels:
+                data = data[:, :self.expected_channels]
         
-        # Ensure data is a 2D numpy array of shape (num_samples, num_channels)
-        # (Assume that if a header column is present it is the first column.)
+        # Ensure data is 2D.
         if data.ndim != 2:
             raise ValueError(f"Data loaded from {file_path} is not 2D.")
-            
-        # If the number of columns is one more than expected (i.e. header + channels),
-        # drop the first column. Otherwise, assume data has only sensor channels.
-        # (You can adjust this logic as needed.)
-        if data.shape[1] > 1:
-            # Here we assume the first column is the header (timestamps).
-            data = data[:, 1:]
-            
-        # data now should be of shape (num_samples, num_channels).
-        num_samples = data.shape[0]
         
-        # If the trial is longer than sequence_length, randomly crop a contiguous segment.
-        # If it is shorter, pad with zeros at the end.
+        num_samples = data.shape[0]
+        # Crop (or pad in time) to the desired sequence length.
         if num_samples >= self.sequence_length:
             start_idx = random.randint(0, num_samples - self.sequence_length)
             data_window = data[start_idx:start_idx + self.sequence_length, :]
@@ -94,151 +136,152 @@ class InertialDataset(Dataset):
             pad_length = self.sequence_length - num_samples
             data_window = np.pad(data, ((0, pad_length), (0, 0)), mode='constant')
         
-        # Optionally apply a transform
+        # Apply any transform, then convert to tensor.
         if self.transform:
             data_window = self.transform(data_window)
         else:
-            # Convert to float32 tensor
             data_window = torch.tensor(data_window, dtype=torch.float32)
         
-        # Return sample and label as a tensor.
         return data_window, torch.tensor(label, dtype=torch.long)
     
     def _get_mode_from_path(self, file_path):
-        """
-        Extracts the locomotion mode from the file path.
-        Assumes the folder structure: <subject>/<date>/<mode>/<sensor>/<file>
-        so that the mode is the third folder from the root.
-        """
         parts = os.path.normpath(file_path).split(os.sep)
-        # Example: ['AB09', '10_21_2018', 'treadmill', 'imu', 'imu_01_01.mat']
-        # The mode is at index -3.
-        if len(parts) < 5:
+        if len(parts) < 4:
             raise ValueError(f"Unexpected file path structure: {file_path}")
         return parts[-3].lower()
     
     def _load_mat_file(self, file_path):
         """
-        Loads a MATLAB file and returns a 2D numpy array containing the sensor data.
-        Assumes the .mat file contains a table with a 'Header' column plus one or more
-        sensor channel columns. The method below shows two strategies:
-          1. If the .mat file contains a structured array with named fields, we drop the
-             'Header' field.
-          2. Otherwise, if the file is stored as a numeric array (with header as first column),
-             we simply drop the first column.
-        You may need to modify this function to match your file format exactly.
+        Tries to load the file using loadmat; if no numeric fields are found,
+        falls back to text reading via _load_as_text.
         """
-        mat_contents = sio.loadmat(file_path)
-        # Exclude MATLAB metadata keys.
+        try:
+            mat_contents = sio.loadmat(file_path)
+        except Exception as e:
+            print(f"Failed to load {file_path} as a MAT file ({e}), trying as text.")
+            return _load_as_text(file_path)
+        
         data_keys = [k for k in mat_contents.keys() if not k.startswith('__')]
         if len(data_keys) == 0:
             raise ValueError(f"No data found in {file_path}.")
         
-        # If the sensor name appears as a key, use it.
         if self.sensor in data_keys:
             data = mat_contents[self.sensor]
         else:
-            # Otherwise, use the first non-metadata key.
             data = mat_contents[data_keys[0]]
             
-        # Check if data is a structured array (has named fields).
         if hasattr(data, 'dtype') and data.dtype.names is not None:
-            # Convert structured array to a numpy array by concatenating fields (except 'Header').
             field_names = data.dtype.names
-            data_list = []
+            numeric_fields = []
             for field in field_names:
                 if field.lower() == 'header':
                     continue
-                # data[field] will have shape (N, 1) or (N,)
-                field_data = np.array(data[field]).squeeze()
-                data_list.append(field_data)
-            # Stack columns to get shape (N, num_channels)
-            data = np.stack(data_list, axis=1)
+                field_data = np.atleast_1d(np.array(data[field]).squeeze())
+                try:
+                    field_data_float = field_data.astype(np.float32)
+                    numeric_fields.append(field_data_float)
+                except Exception as e:
+                    try:
+                        field_data_float = np.array([float(x) for x in field_data])
+                        field_data_float = field_data_float.astype(np.float32)
+                        numeric_fields.append(field_data_float)
+                    except Exception as e2:
+                        print(f"Skipping field {field} in {file_path}: cannot convert to float ({e2})")
+                        continue
+            
+            if len(numeric_fields) == 0:
+                print(f"No numeric fields found in structured array for {file_path}. Falling back to text reading.")
+                return _load_as_text(file_path)
+            
+            min_length = min(arr.shape[0] for arr in numeric_fields)
+            numeric_fields = [arr[:min_length] for arr in numeric_fields]
+            data = np.stack(numeric_fields, axis=1)
         else:
-            # Otherwise, assume data is numeric.
-            # If more than one column, drop the first column assuming it is the header.
+            if data.dtype == np.object_:
+                print(f"Data in {file_path} is of object type, falling back to text reading.")
+                return _load_as_text(file_path)
             if data.ndim == 2 and data.shape[1] > 1:
                 data = data[:, 1:]
-            # Else, leave as is.
-        
-        return data
+                
+        return np.asarray(data, dtype=np.float32)
 
-###############################################################################
-# 2. Baseline Network Definition
-###############################################################################
-
-class BaselineInertialNet(nn.Module):
-    def __init__(self, num_channels, num_classes=5, sequence_length=128):
-        super(BaselineInertialNet, self).__init__()
-        # Convolutional layers to extract temporal features.
-        self.conv1 = nn.Conv1d(in_channels=num_channels, out_channels=32, kernel_size=3)
-        self.bn1 = nn.BatchNorm1d(32)
-        self.pool = nn.MaxPool1d(kernel_size=2)
-        self.conv2 = nn.Conv1d(in_channels=32, out_channels=64, kernel_size=3)
-        self.bn2 = nn.BatchNorm1d(64)
-        
-        # Calculate the length of the sequence after the conv and pooling layers.
-        def calc_output_length(length, kernel_size, pool_size):
-            conv_length = length - (kernel_size - 1)
-            return conv_length // pool_size
-        
-        out_length = calc_output_length(sequence_length, 3, 2)  # after first block
-        out_length = calc_output_length(out_length, 3, 2)         # after second block
-        
-        flattened_size = 64 * out_length
-        
-        # Fully connected layers for classification.
-        self.fc1 = nn.Linear(flattened_size, 100)
-        self.dropout = nn.Dropout(p=0.5)
-        self.fc2 = nn.Linear(100, num_classes)
-    
-    def forward(self, x):
-        # x is expected to have shape: (batch_size, sequence_length, num_channels)
-        # Rearrange to (batch_size, num_channels, sequence_length) for Conv1d.
-        x = x.transpose(1, 2)
-        x = self.pool(F.relu(self.bn1(self.conv1(x))))
-        x = self.pool(F.relu(self.bn2(self.conv2(x))))
-        x = x.view(x.size(0), -1)  # Flatten.
-        x = F.relu(self.fc1(x))
-        x = self.dropout(x)
-        x = self.fc2(x)
-        return x
-
-###############################################################################
-# 3. Example Usage
-###############################################################################
-
+# Example Usage:
 if __name__ == "__main__":
-    # Set parameters.
-    root_directory = "/path/to/your/dataset"  # Update this to the root of your data.
-    sensor_to_use = "imu"                     # You can change this to any available sensor.
+    from torch.utils.data import DataLoader
+
+    root_directory = "dataset"  # Update path as needed.
+    sensor_to_use = "imu"
     sequence_length = 128
     batch_size = 8
+    expected_channels = 4  # <-- Set this to the number you want all samples to have.
 
-    # Create dataset. (Optionally, you can filter for specific modes using mode_filter.)
-    dataset = InertialDataset(root_dir=root_directory, sensor=sensor_to_use, 
-                              sequence_length=sequence_length, mode_filter=None)
-    
-    # For example, get one sample to determine the number of channels.
+    dataset = InertialDataset(root_dir=root_directory,
+                              sensor=sensor_to_use,
+                              sequence_length=sequence_length,
+                              mode_filter=["levelground"],
+                              expected_channels=expected_channels)
+
+    # Print info for one sample.
     sample_data, sample_label = dataset[0]
-    # sample_data shape should be (sequence_length, num_channels)
-    num_channels = sample_data.shape[1]
-    print(f"Sample data shape: {sample_data.shape}, label: {sample_label.item()}")
-    
-    # Create DataLoader.
+    print(f"Sample data shape: {sample_data.shape}, Label: {sample_label.item()}")
+
     dataloader = DataLoader(dataset, batch_size=batch_size, shuffle=True)
-    
-    # Instantiate the baseline network.
-    num_classes = 5  # Based on our mode mapping.
-    model = BaselineInertialNet(num_channels=num_channels, num_classes=num_classes, 
-                                sequence_length=sequence_length)
-    
-    # Print model summary.
-    print(model)
-    
-    # Example forward pass with one batch.
+
     for batch_data, batch_labels in dataloader:
-        # batch_data: (batch_size, sequence_length, num_channels)
-        outputs = model(batch_data)
-        print("Output shape:", outputs.shape)  # Expected: (batch_size, num_classes)
-        break  # Just one batch for demonstration.
+        print("Batch data shape:", batch_data.shape)  # Should be (batch_size, sequence_length, expected_channels)
+        print("Batch labels:", batch_labels)
+        break
+
+
+import matplotlib.pyplot as plt
+
+# --- Visualize a single sample from the dataset ---
+# Get one sample (data and label)
+sample_data, sample_label = dataset[0]
+# sample_data is a torch.Tensor of shape [128, 4]. Convert it to a NumPy array.
+sample_np = sample_data.numpy()
+
+# Create a time axis (for example, one point per time step)
+time = np.arange(sample_np.shape[0])
+
+# Create subplots: one for each channel
+num_channels = sample_np.shape[1]
+fig, axs = plt.subplots(num_channels, 1, figsize=(12, 2*num_channels), sharex=True)
+
+# If there's only one channel, axs might not be a list; ensure it's a list:
+if num_channels == 1:
+    axs = [axs]
+
+for i in range(num_channels):
+    axs[i].plot(time, sample_np[:, i], label=f'Channel {i+1}')
+    axs[i].set_ylabel(f'Ch {i+1}')
+    axs[i].legend(loc='upper right')
+    
+axs[-1].set_xlabel('Time step')
+plt.suptitle(f'Sample Label: {sample_label.item()}')
+plt.tight_layout(rect=[0, 0.03, 1, 0.95])
+plt.show()
+
+# --- Visualize a batch of samples (optional) ---
+# Get one batch from the DataLoader
+batch_data, batch_labels = next(iter(dataloader))
+# batch_data is of shape [batch_size, sequence_length, channels]
+batch_np = batch_data.numpy()
+
+# Plot the first sample in the batch as an example.
+sample_idx = 0
+sample_np = batch_np[sample_idx]
+time = np.arange(sample_np.shape[0])
+fig, axs = plt.subplots(num_channels, 1, figsize=(12, 2*num_channels), sharex=True)
+if num_channels == 1:
+    axs = [axs]
+
+for i in range(num_channels):
+    axs[i].plot(time, sample_np[:, i], label=f'Channel {i+1}')
+    axs[i].set_ylabel(f'Ch {i+1}')
+    axs[i].legend(loc='upper right')
+
+axs[-1].set_xlabel('Time step')
+plt.suptitle(f'Batch Sample {sample_idx}, Label: {batch_labels[sample_idx].item()}')
+plt.tight_layout(rect=[0, 0.03, 1, 0.95])
+plt.show()
