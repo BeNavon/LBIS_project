@@ -3,285 +3,221 @@ import glob
 import numpy as np
 import scipy.io as sio
 import torch
-from torch.utils.data import Dataset
+import torch.nn as nn
+import torch.nn.functional as F
+from torch.utils.data import Dataset, DataLoader
 import random
-import pandas as pd  # needed for _load_as_text below
 
-def _load_as_text(file_path):
-    """
-    Fallback function to load a file as a text table using pandas.
-    
-    This function uses a regex separator (splitting on one or more tabs or commas),
-    skips the header row, and uses on_bad_lines='skip' to ignore malformed lines.
-    It first attempts to read with UTF-8 encoding; if that fails, it falls back to latin1.
-    After reading, it converts all columns to numeric (non-numeric values become NaN)
-    and fills missing values before converting to a float32 NumPy array.
-    """
-    try:
-        # Attempt with UTF-8 encoding.
-        df = pd.read_csv(
-            file_path,
-            sep=r'[\t,]+',
-            engine='python',
-            skiprows=1,      # Skip header row
-            header=None,
-            encoding='utf-8',
-            on_bad_lines='skip'
-        )
-    except UnicodeDecodeError as e:
-        print(f"Unicode decode error for {file_path} with utf-8: {e}. Trying latin1 encoding.")
-        try:
-            df = pd.read_csv(
-                file_path,
-                sep=r'[\t,]+',
-                engine='python',
-                skiprows=1,
-                header=None,
-                encoding='latin1',
-                on_bad_lines='skip'
-            )
-        except Exception as e2:
-            raise ValueError(f"Failed to load {file_path} as text with pandas using latin1: {e2}")
-    except Exception as e:
-        raise ValueError(f"Failed to load {file_path} as text with pandas: {e}")
-    
-    # Convert every column to numeric, coercing errors to NaN.
-    df = df.apply(pd.to_numeric, errors='coerce')
-    # Replace NaN values with 0 (or another appropriate value).
-    df = df.fillna(0)
-    
-    try:
-        data = df.to_numpy(dtype=np.float32)
-    except Exception as e:
-        raise ValueError(f"Could not convert data from {file_path} to float32: {e}")
-    
-    return data
+###############################################################################
+# 1. Dataset Definition: Treadmill Gait Phase Estimation from Thigh & Shank IMUs
+###############################################################################
 
-
-class InertialDataset(Dataset):
-    def __init__(self, root_dir, sensor='imu', sequence_length=128,
-                 mode_filter=None, transform=None, expected_channels=None):
+class TreadmillGaitDataset(Dataset):
+    def __init__(self, root_dir, sequence_length=128, subject_filter=None, transform=None):
         """
         Args:
-            root_dir (str): Root folder (e.g., "dataset").
-            sensor (str): Sensor name (e.g., 'imu').
-            sequence_length (int): Number of time steps per sample.
-            mode_filter (list or None): List of locomotion modes to include (e.g. ["levelground"]).
-            transform (callable, optional): Optional transform to apply.
-            expected_channels (int, optional): Force all returned samples to have this many channels.
-                If a sample has fewer columns, it is padded with zeros; if more, it is trimmed.
+            root_dir (str): Path to the folder containing all .mat files.
+            sequence_length (int): Fixed number of time steps per sample.
+            subject_filter (list or None): If provided, only include files whose
+                subject (extracted from the filename) is in this list.
+            transform (callable, optional): Optional transform to apply on the data.
         """
         self.root_dir = root_dir
-        self.sensor = sensor
         self.sequence_length = sequence_length
         self.transform = transform
-        self.expected_channels = expected_channels  # e.g., 4 or 24
         
-        # Mapping for locomotion mode labels.
-        self.mode_mapping = {
-            'treadmill': 0,
-            'levelground': 1,
-            'ramp': 2,
-            'stair': 3,
-            'static': 4
-        }
-        
-        # Search for files: dataset/AB*/<date>/levelground/<sensor>/*.mat
-        search_path = os.path.join(self.root_dir, "AB*", "*", "levelground", self.sensor, "*.mat")
-        all_files = glob.glob(search_path, recursive=True)
-        
-        # Exclude files from any "osimxml" folder.
-        self.file_list = [f for f in all_files if "osimxml" not in f.lower()]
-        
-        # Apply mode filter if provided.
-        if mode_filter is not None:
-            self.file_list = [f for f in self.file_list if self._get_mode_from_path(f) in mode_filter]
-        
+        # List all .mat files in the folder.
+        self.file_list = glob.glob(os.path.join(self.root_dir, '*.mat'))
         if len(self.file_list) == 0:
-            raise RuntimeError(f'No files found with sensor "{self.sensor}" in {self.root_dir}!')
-            
+            raise RuntimeError(f"No .mat files found in {self.root_dir}!")
+        
+        # If a subject filter is provided, restrict the files to those subjects.
+        if subject_filter is not None:
+            self.file_list = [f for f in self.file_list 
+                               if self._get_subject_from_path(f) in subject_filter]
+        
     def __len__(self):
         return len(self.file_list)
     
     def __getitem__(self, idx):
+        # Get the file path and subject id.
         file_path = self.file_list[idx]
-        mode = self._get_mode_from_path(file_path)
-        try:
-            label = self.mode_mapping[mode]
-        except KeyError:
-            raise ValueError(f"Unknown mode '{mode}' found in path: {file_path}")
+        subject_id = self._get_subject_from_path(file_path)
         
-        # Load sensor data.
-        data = self._load_mat_file(file_path)
+        # Load sensor data and gait phase from the .mat file.
+        sensor_data_full, gait_phase = self._load_mat_file(file_path)
+        # sensor_data_full is expected to be shape (N, 25)
+        if sensor_data_full.ndim != 2 or sensor_data_full.shape[1] != 25:
+            raise ValueError(f"Unexpected sensor data shape {sensor_data_full.shape} in file: {file_path}")
         
-        # Enforce fixed channel dimension if expected_channels is set.
-        if self.expected_channels is not None:
-            current_channels = data.shape[1]
-            if current_channels < self.expected_channels:
-                pad_width = self.expected_channels - current_channels
-                data = np.pad(data, ((0, 0), (0, pad_width)), mode='constant')
-            elif current_channels > self.expected_channels:
-                data = data[:, :self.expected_channels]
+        # Drop the header (first column) so that sensor data becomes (N, 24).
+        sensor_data_full = sensor_data_full[:, 1:]
+        # Now, select only the shank and thigh channels.
+        # After dropping header: columns 0-5: foot, 6-11: shank, 12-17: thigh, 18-23: trunk.
+        # We select columns 6:18 to obtain shank (6 columns) and thigh (6 columns) = 12 channels.
+        sensor_data = sensor_data_full[:, 6:18]  # shape (N, 12)
         
-        # Ensure data is 2D.
-        if data.ndim != 2:
-            raise ValueError(f"Data loaded from {file_path} is not 2D.")
-        
-        num_samples = data.shape[0]
-        # Crop (or pad in time) to the desired sequence length.
+        num_samples = sensor_data.shape[0]
+        # Determine a window of fixed length.
         if num_samples >= self.sequence_length:
+            # Randomly select a start index so that the window fits in the trial.
             start_idx = random.randint(0, num_samples - self.sequence_length)
-            data_window = data[start_idx:start_idx + self.sequence_length, :]
+            window_data = sensor_data[start_idx:start_idx + self.sequence_length, :]
+            # Use the gait phase at the last time step in the window as the target.
+            window_label = gait_phase[start_idx + self.sequence_length - 1]
         else:
+            # If too short, pad sensor data with zeros at the end.
             pad_length = self.sequence_length - num_samples
-            data_window = np.pad(data, ((0, pad_length), (0, 0)), mode='constant')
+            window_data = np.pad(sensor_data, ((0, pad_length), (0, 0)), mode='constant')
+            # Use the last available gait phase as the target.
+            window_label = gait_phase[-1]
         
-        # Apply any transform, then convert to tensor.
         if self.transform:
-            data_window = self.transform(data_window)
+            window_data = self.transform(window_data)
         else:
-            data_window = torch.tensor(data_window, dtype=torch.float32)
+            window_data = torch.tensor(window_data, dtype=torch.float32)
         
-        return data_window, torch.tensor(label, dtype=torch.long)
+        # For regression, label is a float tensor (you could also normalize it as needed).
+        window_label = torch.tensor(window_label, dtype=torch.float32)
+        
+        # Return the sensor window, the gait phase label, and the subject id.
+        return window_data, window_label, subject_id
     
-    def _get_mode_from_path(self, file_path):
-        parts = os.path.normpath(file_path).split(os.sep)
-        if len(parts) < 4:
-            raise ValueError(f"Unexpected file path structure: {file_path}")
-        return parts[-3].lower()
+    def _get_subject_from_path(self, file_path):
+        """
+        Extract the subject id from the file name.
+        Assumes the file name is formatted like "AB09_treadmill_trial1.mat"
+        where "AB09" is the subject id.
+        """
+        base = os.path.basename(file_path)  # e.g., "AB09_treadmill_trial1.mat"
+        subject_id = base.split('_')[0]
+        return subject_id.strip()
     
     def _load_mat_file(self, file_path):
         """
-        Tries to load the file using loadmat; if no numeric fields are found,
-        falls back to text reading via _load_as_text.
+        Loads a MATLAB file and returns a tuple: (sensor_data, gait_phase)
+        - sensor_data: A numeric array of shape (N, 25) (including header)
+        - gait_phase: A numeric vector of length N.
+        
+        Assumes that the .mat file contains two variables: one containing the sensor
+        data (the first non-metadata variable) and one named "gait_phase".
         """
-        try:
-            mat_contents = sio.loadmat(file_path)
-        except Exception as e:
-            print(f"Failed to load {file_path} as a MAT file ({e}), trying as text.")
-            return _load_as_text(file_path)
-        
+        mat_contents = sio.loadmat(file_path)
+        # Exclude MATLAB metadata keys.
         data_keys = [k for k in mat_contents.keys() if not k.startswith('__')]
-        if len(data_keys) == 0:
-            raise ValueError(f"No data found in {file_path}.")
+        if 'gait_phase' not in data_keys:
+            raise ValueError(f"'gait_phase' variable not found in {file_path}.")
         
-        if self.sensor in data_keys:
-            data = mat_contents[self.sensor]
-        else:
-            data = mat_contents[data_keys[0]]
-            
-        if hasattr(data, 'dtype') and data.dtype.names is not None:
-            field_names = data.dtype.names
-            numeric_fields = []
-            for field in field_names:
-                if field.lower() == 'header':
-                    continue
-                field_data = np.atleast_1d(np.array(data[field]).squeeze())
-                try:
-                    field_data_float = field_data.astype(np.float32)
-                    numeric_fields.append(field_data_float)
-                except Exception as e:
-                    try:
-                        field_data_float = np.array([float(x) for x in field_data])
-                        field_data_float = field_data_float.astype(np.float32)
-                        numeric_fields.append(field_data_float)
-                    except Exception as e2:
-                        print(f"Skipping field {field} in {file_path}: cannot convert to float ({e2})")
-                        continue
-            
-            if len(numeric_fields) == 0:
-                print(f"No numeric fields found in structured array for {file_path}. Falling back to text reading.")
-                return _load_as_text(file_path)
-            
-            min_length = min(arr.shape[0] for arr in numeric_fields)
-            numeric_fields = [arr[:min_length] for arr in numeric_fields]
-            data = np.stack(numeric_fields, axis=1)
-        else:
-            if data.dtype == np.object_:
-                print(f"Data in {file_path} is of object type, falling back to text reading.")
-                return _load_as_text(file_path)
-            if data.ndim == 2 and data.shape[1] > 1:
-                data = data[:, 1:]
-                
-        return np.asarray(data, dtype=np.float32)
+        # Extract gait_phase.
+        gait_phase = np.squeeze(mat_contents['gait_phase'])
+        # Remove gait_phase from the keys to identify the sensor data variable.
+        data_keys.remove('gait_phase')
+        if len(data_keys) == 0:
+            raise ValueError(f"No sensor data found in {file_path}.")
+        # Use the first remaining key as sensor data.
+        sensor_data = np.array(mat_contents[data_keys[0]])
+        return sensor_data, gait_phase
 
-# Example Usage:
+###############################################################################
+# 2. Baseline Neural Network for Gait Phase Regression
+###############################################################################
+
+class BaselineGaitPhaseNet(nn.Module):
+    def __init__(self, num_channels=12, sequence_length=128):
+        """
+        Args:
+            num_channels (int): Number of sensor channels (12 for shank+thigh).
+            sequence_length (int): Number of time steps per input sample.
+        """
+        super(BaselineGaitPhaseNet, self).__init__()
+        
+        # Two 1D convolutional blocks.
+        self.conv1 = nn.Conv1d(in_channels=num_channels, out_channels=32, kernel_size=3)
+        self.bn1   = nn.BatchNorm1d(32)
+        self.pool  = nn.MaxPool1d(kernel_size=2)
+        
+        self.conv2 = nn.Conv1d(in_channels=32, out_channels=64, kernel_size=3)
+        self.bn2   = nn.BatchNorm1d(64)
+        
+        # Calculate the length of the sequence after two conv+pool blocks.
+        def calc_output_length(L, kernel_size, pool_size):
+            conv_L = L - (kernel_size - 1)
+            return conv_L // pool_size
+        
+        out_length = calc_output_length(sequence_length, 3, 2)  # After first block.
+        out_length = calc_output_length(out_length, 3, 2)         # After second block.
+        flattened_size = 64 * out_length
+        
+        # Fully connected layers for regression.
+        self.fc1 = nn.Linear(flattened_size, 100)
+        self.dropout = nn.Dropout(p=0.5)
+        # Final output: one continuous value (the estimated gait phase).
+        self.fc2 = nn.Linear(100, 1)
+    
+    def forward(self, x):
+        # x: (batch_size, sequence_length, num_channels)
+        # Rearrange to (batch_size, num_channels, sequence_length) for Conv1d.
+        x = x.transpose(1, 2)
+        x = self.pool(F.relu(self.bn1(self.conv1(x))))
+        x = self.pool(F.relu(self.bn2(self.conv2(x))))
+        x = x.view(x.size(0), -1)  # Flatten.
+        x = F.relu(self.fc1(x))
+        x = self.dropout(x)
+        x = self.fc2(x)  # No activation; regression output.
+        return x.squeeze(1)  # Return shape (batch_size,)
+
+###############################################################################
+# 3. Example Usage with One-Subject-Out Cross Validation
+###############################################################################
+
 if __name__ == "__main__":
-    from torch.utils.data import DataLoader
-
-    root_directory = "dataset"  # Update path as needed.
-    sensor_to_use = "imu"
+    # Parameters.
+    root_directory = "data"  # Folder containing the .mat files.
     sequence_length = 128
     batch_size = 8
-    expected_channels = 4  # <-- Set this to the number you want all samples to have.
-
-    dataset = InertialDataset(root_dir=root_directory,
-                              sensor=sensor_to_use,
-                              sequence_length=sequence_length,
-                              mode_filter=["levelground"],
-                              expected_channels=expected_channels)
-
-    # Print info for one sample.
-    sample_data, sample_label = dataset[0]
-    print(f"Sample data shape: {sample_data.shape}, Label: {sample_label.item()}")
-
-    dataloader = DataLoader(dataset, batch_size=batch_size, shuffle=True)
-
-    for batch_data, batch_labels in dataloader:
-        print("Batch data shape:", batch_data.shape)  # Should be (batch_size, sequence_length, expected_channels)
-        print("Batch labels:", batch_labels)
+    
+    # Gather all .mat files and determine all subject IDs.
+    all_files = glob.glob(os.path.join(root_directory, '*.mat'))
+    def get_subject(file_path):
+        base = os.path.basename(file_path)
+        return base.split('_')[1].strip()
+    all_subjects = sorted(list(set(get_subject(f) for f in all_files)))
+    print("All subjects in dataset:", all_subjects)
+    
+    # One-Subject-Out Cross Validation:
+    # For demonstration, we leave out the first subject as the test subject.
+    test_subject = all_subjects[0]
+    train_subjects = [sub for sub in all_subjects if sub != test_subject]
+    print(f"Test subject: {test_subject}")
+    print(f"Training subjects: {train_subjects}")
+    
+    # Create datasets.
+    train_dataset = TreadmillGaitDataset(root_dir=root_directory, 
+                                           sequence_length=sequence_length,
+                                           subject_filter=train_subjects)
+    test_dataset = TreadmillGaitDataset(root_dir=root_directory, 
+                                          sequence_length=sequence_length,
+                                          subject_filter=[test_subject])
+    
+    # Create DataLoaders.
+    train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True)
+    test_loader  = DataLoader(test_dataset, batch_size=batch_size, shuffle=False)
+    
+    # Instantiate the network.
+    model = BaselineGaitPhaseNet(num_channels=12, sequence_length=sequence_length)
+    print(model)
+    
+    # For demonstration, run one forward pass on a batch from the training loader.
+    for batch_data, batch_labels, batch_subjects in train_loader:
+        # batch_data: shape (batch_size, sequence_length, 12)
+        # batch_labels: shape (batch_size,)
+        outputs = model(batch_data)
+        print("Input batch shape:", batch_data.shape)
+        print("Output (estimated gait phase) shape:", outputs.shape)
+        print("Gait phase labels:", batch_labels)
         break
 
-
-import matplotlib.pyplot as plt
-
-# --- Visualize a single sample from the dataset ---
-# Get one sample (data and label)
-sample_data, sample_label = dataset[0]
-# sample_data is a torch.Tensor of shape [128, 4]. Convert it to a NumPy array.
-sample_np = sample_data.numpy()
-
-# Create a time axis (for example, one point per time step)
-time = np.arange(sample_np.shape[0])
-
-# Create subplots: one for each channel
-num_channels = sample_np.shape[1]
-fig, axs = plt.subplots(num_channels, 1, figsize=(12, 2*num_channels), sharex=True)
-
-# If there's only one channel, axs might not be a list; ensure it's a list:
-if num_channels == 1:
-    axs = [axs]
-
-for i in range(num_channels):
-    axs[i].plot(time, sample_np[:, i], label=f'Channel {i+1}')
-    axs[i].set_ylabel(f'Ch {i+1}')
-    axs[i].legend(loc='upper right')
-    
-axs[-1].set_xlabel('Time step')
-plt.suptitle(f'Sample Label: {sample_label.item()}')
-plt.tight_layout(rect=[0, 0.03, 1, 0.95])
-plt.show()
-
-# --- Visualize a batch of samples (optional) ---
-# Get one batch from the DataLoader
-batch_data, batch_labels = next(iter(dataloader))
-# batch_data is of shape [batch_size, sequence_length, channels]
-batch_np = batch_data.numpy()
-
-# Plot the first sample in the batch as an example.
-sample_idx = 0
-sample_np = batch_np[sample_idx]
-time = np.arange(sample_np.shape[0])
-fig, axs = plt.subplots(num_channels, 1, figsize=(12, 2*num_channels), sharex=True)
-if num_channels == 1:
-    axs = [axs]
-
-for i in range(num_channels):
-    axs[i].plot(time, sample_np[:, i], label=f'Channel {i+1}')
-    axs[i].set_ylabel(f'Ch {i+1}')
-    axs[i].legend(loc='upper right')
-
-axs[-1].set_xlabel('Time step')
-plt.suptitle(f'Batch Sample {sample_idx}, Label: {batch_labels[sample_idx].item()}')
-plt.tight_layout(rect=[0, 0.03, 1, 0.95])
-plt.show()
+    # In a full training pipeline, you would define an optimizer and loss function:
+    # optimizer = torch.optim.Adam(model.parameters(), lr=1e-3)
+    # criterion = nn.MSELoss()
+    # Then, iterate over train_loader for training and use test_loader for validation.

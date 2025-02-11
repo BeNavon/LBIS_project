@@ -1,0 +1,5 @@
+sequence_length 
+root_directory
+test_dataset 
+
+In our example we assume that each MATLAB file contains a variable called "strides", which is a cell array of strides, and that each stride is stored as a 2D array of size roughly (101, 25).
