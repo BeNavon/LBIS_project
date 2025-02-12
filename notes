@@ -2,4 +2,5 @@ sequence_length
 root_directory
 test_dataset 
 
-In our example we assume that each MATLAB file contains a variable called "strides", which is a cell array of strides, and that each stride is stored as a 2D array of size roughly (101, 25).
+visualize the results by plotting gait profiles of data for each stride, averaged over all strides for each subject, and averaged over subjects.
+
