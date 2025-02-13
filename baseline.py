@@ -1,26 +1,32 @@
+#%% Imports and seed
 import os
 import glob
 import random
+import copy
 import numpy as np
-import scipy.io as sio
+import matplotlib.pyplot as plt
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.data import Dataset, DataLoader
 
-###############################################################################
-# 1. Custom Dataset for Right-Leg Gait Phase Estimation
-###############################################################################
+# Set random seed for reproducibility
+torch.manual_seed(22)
+np.random.seed(22)
+random.seed(22)
+
+#%% Custom Dataset for Right-Leg Gait Phase Estimation (CSV version)
 class GaitPhaseDataset(Dataset):
     def __init__(self, root_dir, sequence_length=128, subjects=None, transform=None):
         """
         Args:
             root_dir (str): Root directory of the dataset. Files are expected under:
-                <root_dir>/<subject>/<date>/treadmill/imu/*.mat
+                dataset/<subject>/<date>/treadmill/imu/*.csv
                 and corresponding gait cycle files under:
-                <root_dir>/<subject>/<date>/treadmill/gcRight/*.mat.
+                dataset/<subject>/<date>/treadmill/gcRight/*.csv.
             sequence_length (int): Number of time steps in each sample window.
-            subjects (list of str or None): List of subject IDs to include (e.g., ['AB09', 'AB10']).
+            subjects (list of str or None): List of subject IDs (e.g., ['AB09', 'AB10']).
                 If None, all subjects are used.
             transform (callable, optional): Optional transform to be applied on the IMU window.
         """
@@ -28,12 +34,12 @@ class GaitPhaseDataset(Dataset):
         self.sequence_length = sequence_length
         self.transform = transform
 
-        # Locate all treadmill IMU files (assumed to be from the right leg)
-        search_path = os.path.join(root_dir, '*', '*', 'treadmill', 'imu', '*.mat')
+        # Locate all treadmill IMU CSV files.
+        search_path = os.path.join(root_dir, '*', '*', 'treadmill', 'imu', '*.csv')
         self.imu_files = glob.glob(search_path, recursive=True)
         if subjects is not None:
-            # Assumes subject folder is the first folder in the path.
-            self.imu_files = [f for f in self.imu_files if f.split(os.sep)[-5] in subjects]
+            # Assume that the subject folder is the first folder under root_dir.
+            self.imu_files = [f for f in self.imu_files if os.path.basename(os.path.dirname(os.path.dirname(os.path.dirname(f)))) in subjects]
         
         if len(self.imu_files) == 0:
             raise RuntimeError("No IMU files found. Please check your dataset directory and folder structure.")
@@ -42,31 +48,35 @@ class GaitPhaseDataset(Dataset):
         return len(self.imu_files)
     
     def __getitem__(self, idx):
-        # Get the path to the IMU file.
+        # Get the IMU CSV file path.
         imu_path = self.imu_files[idx]
-        # Derive the corresponding gcRight file path by replacing the folder name:
-        # e.g., .../treadmill/imu/imu_01_01.mat  -->  .../treadmill/gcRight/imu_01_01.mat
+        # Derive the corresponding gcRight CSV file path by replacing 'imu' with 'gcRight'
         gcRight_path = imu_path.replace(os.sep + 'imu' + os.sep, os.sep + 'gcRight' + os.sep)
         
-        # Load IMU data.
-        imu_data = self._load_mat_file(imu_path)
-        # Load gait cycle data for the right leg.
-        gcRight_data = self._load_mat_file(gcRight_path)
+        # Load CSV files (skip the header row)
+        imu_data = self._load_csv_file(imu_path)
+        gcRight_data = self._load_csv_file(gcRight_path)
         
-        # Drop the header column (assumed to be the first column representing time)
+        # Drop the timestamp column (first column)
         imu_data = imu_data[:, 1:]
         gcRight_data = gcRight_data[:, 1:]
         
-        # Select only shank and thigh channels from the IMU data.
-        # Channel ordering (after header removal):
-        # [foot_Accel (3), foot_Gyro (3), shank_Accel (3), shank_Gyro (3),
-        #  thigh_Accel (3), thigh_Gyro (3), trunk_Accel (3), trunk_Gyro (3)]
-        # We keep shank (columns 6 to 11) and thigh (columns 12 to 17) → total 12 channels.
+        # Select only shank and thigh channels from IMU data.
+        # CSV column order (after dropping timestamp) is:
+        # [foot_Accel_X, foot_Accel_Y, foot_Accel_Z,
+        #  foot_Gyro_X, foot_Gyro_Y, foot_Gyro_Z,
+        #  shank_Accel_X, shank_Accel_Y, shank_Accel_Z,
+        #  shank_Gyro_X, shank_Gyro_Y, shank_Gyro_Z,
+        #  thigh_Accel_X, thigh_Accel_Y, thigh_Accel_Z,
+        #  thigh_Gyro_X, thigh_Gyro_Y, thigh_Gyro_Z,
+        #  trunk_Accel_X, trunk_Accel_Y, trunk_Accel_Z,
+        #  trunk_Gyro_X, trunk_Gyro_Y, trunk_Gyro_Z]
+        # We keep shank (columns 6 to 11) and thigh (columns 12 to 17)
         shank = imu_data[:, 6:12]
         thigh = imu_data[:, 12:18]
-        imu_selected = np.concatenate([shank, thigh], axis=1)  # shape: (N, 12)
+        imu_selected = np.concatenate([shank, thigh], axis=1)  # Shape: (N, 12)
         
-        # Synchronize lengths (use the minimum available length across files).
+        # Synchronize lengths: truncate all signals to the minimum available length.
         min_length = min(imu_selected.shape[0], gcRight_data.shape[0])
         imu_selected = imu_selected[:min_length, :]
         gcRight_data = gcRight_data[:min_length, :]
@@ -75,17 +85,16 @@ class GaitPhaseDataset(Dataset):
         if min_length > self.sequence_length:
             start_idx = random.randint(0, min_length - self.sequence_length)
         else:
-            start_idx = 0  # Alternatively, pad if desired.
+            start_idx = 0  # Alternatively, pad shorter sequences.
         end_idx = start_idx + self.sequence_length
-        imu_window = imu_selected[start_idx:end_idx, :]  # shape: (sequence_length, 12)
+        imu_window = imu_selected[start_idx:end_idx, :]  # (sequence_length, 12)
         
-        # Use the gait phase (HeelStrike value) from gcRight at the center of the window.
+        # Use the HeelStrike value from gcRight at the center of the window.
         center_idx = start_idx + self.sequence_length // 2
-        gait_phase_right = gcRight_data[center_idx, 0]   # HeelStrike value (0–100)
-        # Normalize to [0, 1]:
-        gait_phase_right = gait_phase_right / 100.0
-        # The target is now a single scalar.
-        target = np.array([gait_phase_right], dtype=np.float32)
+        heel_strike = gcRight_data[center_idx, 0]  # HeelStrike value (0-100)
+        # Normalize to [0, 1]
+        heel_strike_norm = heel_strike / 100.0
+        target = np.array([heel_strike_norm], dtype=np.float32)
         
         # Optionally apply a transform; otherwise, convert to torch tensors.
         if self.transform:
@@ -96,141 +105,169 @@ class GaitPhaseDataset(Dataset):
         
         return imu_window, target
 
-    def _load_mat_file(self, file_path):
-        """Load a .mat file and return the main data array.
-           Assumes that the .mat file contains one primary variable (besides metadata).
-        """
-        try:
-            # Try loading as v7.3 format first
-            with h5py.File(file_path, 'r') as f:
-                data = f['data'][:]
-                return np.array(data)
-        except:
-            # Fall back to older MATLAB format
-            mat_contents = sio.loadmat(file_path)
-            data_keys = [k for k in mat_contents.keys() if not k.startswith('__')]
-            if len(data_keys) == 0:
-                raise ValueError(f"No data found in {file_path}")
-            data = mat_contents[data_keys[0]]
-            return data
+    def _load_csv_file(self, file_path):
+        """Loads a CSV file using NumPy (skipping the header row)."""
+        data = np.loadtxt(file_path, delimiter=',', skiprows=1)
+        return data
 
-###############################################################################
-# 2. Baseline Convolutional Network for Right-Leg Gait Phase Estimation
-###############################################################################
-class GaitPhaseEstimator(nn.Module):
-    def __init__(self, num_channels=12, sequence_length=128, output_dim=1):
+#%% Baseline CNN Model for Gait Phase Estimation (Regression)
+class BaselineGaitPhaseCNN(nn.Module):
+    def __init__(self, num_channels=12, sequence_length=128, output_dim=1, dropout_rate=0.5):
         """
         Args:
-            num_channels (int): Number of input channels (here, 12: shank and thigh).
-            sequence_length (int): Length of the input window (number of time steps).
-            output_dim (int): Dimension of the regression output (here, 1: right-leg gait phase).
+            num_channels (int): Number of input channels (here, 12 from shank+thigh).
+            sequence_length (int): Length of the input window.
+            output_dim (int): Dimension of the regression output (1 value: normalized HeelStrike).
+            dropout_rate (float): Dropout probability.
         """
-        super(GaitPhaseEstimator, self).__init__()
-        # Convolutional layers for temporal feature extraction.
+        super(BaselineGaitPhaseCNN, self).__init__()
         self.conv1 = nn.Conv1d(in_channels=num_channels, out_channels=32, kernel_size=3)
-        self.bn1   = nn.BatchNorm1d(32)
-        self.pool  = nn.MaxPool1d(kernel_size=2)
+        self.bn1 = nn.BatchNorm1d(32)
+        self.pool = nn.MaxPool1d(kernel_size=2)
         self.conv2 = nn.Conv1d(in_channels=32, out_channels=64, kernel_size=3)
-        self.bn2   = nn.BatchNorm1d(64)
+        self.bn2 = nn.BatchNorm1d(64)
         
-        # Compute the length of the sequence after convolution and pooling.
-        def calc_output_length(L, kernel_size, pool_size):
+        # Calculate the output length after two conv+pool layers.
+        def calc_out_length(L, kernel_size, pool_size):
             conv_L = L - (kernel_size - 1)
             return conv_L // pool_size
         
-        out_length = calc_output_length(sequence_length, 3, 2)  # after first block
-        out_length = calc_output_length(out_length, 3, 2)         # after second block
+        out_length = calc_out_length(sequence_length, 3, 2)  # after first block
+        out_length = calc_out_length(out_length, 3, 2)         # after second block
         flattened_size = 64 * out_length
         
-        # Fully connected layers for regression.
         self.fc1 = nn.Linear(flattened_size, 100)
-        self.dropout = nn.Dropout(p=0.5)
-        self.fc2 = nn.Linear(100, output_dim)  # Regression output: 1 value
+        self.dropout = nn.Dropout(dropout_rate)
+        self.fc2 = nn.Linear(100, output_dim)  # Linear output for regression
         
     def forward(self, x):
         # x shape: (batch_size, sequence_length, num_channels)
-        # Rearrange to (batch_size, num_channels, sequence_length) for Conv1d.
-        x = x.transpose(1, 2)
+        x = x.transpose(1, 2)  # (batch_size, num_channels, sequence_length)
         x = self.pool(F.relu(self.bn1(self.conv1(x))))
         x = self.pool(F.relu(self.bn2(self.conv2(x))))
-        x = x.view(x.size(0), -1)  # Flatten.
+        x = x.view(x.size(0), -1)  # Flatten
         x = F.relu(self.fc1(x))
         x = self.dropout(x)
         x = self.fc2(x)
         return x
 
-###############################################################################
-# 3. Example Usage with One-Subject-Out Cross-Validation
-###############################################################################
-if __name__ == "__main__":
-    # Set device (CPU or CUDA).
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+#%% Training and Evaluation Functions (Regression)
+def train_model(model, device, train_loader, val_loader, criterion, optimizer, scheduler, num_epochs):
+    best_model_weights = copy.deepcopy(model.state_dict())
+    best_val_loss = float('inf')
+    train_loss_history = []
+    val_loss_history = []
     
-    # --- User parameters ---
-    root_directory = "dataset"  # Update with your dataset root.
-    sequence_length = 128
-    batch_size = 8
-    num_epochs = 5  # For demonstration; adjust as needed.
-    
-    # List all subject folders (assumed to be top-level folders in root_directory).
-    all_subjects = [d for d in os.listdir(root_directory) 
-                    if os.path.isdir(os.path.join(root_directory, d))]
-    all_subjects.sort()
-    
-    print("Subjects found:", all_subjects)
-    
-    # One-subject-out cross-validation:
-    for test_subject in all_subjects:
-        train_subjects = [s for s in all_subjects if s != test_subject]
-        print(f"\n--- One-Subject-Out Split ---")
-        print(f"Training on subjects: {train_subjects}")
-        print(f"Testing on subject: {test_subject}")
-        
-        # Create dataset splits.
-        train_dataset = GaitPhaseDataset(root_dir=root_directory,
-                                         sequence_length=sequence_length,
-                                         subjects=train_subjects)
-        test_dataset  = GaitPhaseDataset(root_dir=root_directory,
-                                         sequence_length=sequence_length,
-                                         subjects=[test_subject])
-        
-        train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True)
-        test_loader  = DataLoader(test_dataset, batch_size=batch_size, shuffle=False)
-        
-        # Initialize the model.
-        model = GaitPhaseEstimator(num_channels=12, sequence_length=sequence_length, output_dim=1)
-        model.to(device)
-        
-        # Define optimizer and loss function (MSE for regression).
-        optimizer = torch.optim.Adam(model.parameters(), lr=1e-3)
-        criterion = nn.MSELoss()
-        
-        # --- Training Loop (demonstration) ---
+    model.to(device)
+    for epoch in range(num_epochs):
         model.train()
-        for epoch in range(num_epochs):
-            running_loss = 0.0
-            for batch_data, batch_targets in train_loader:
-                batch_data, batch_targets = batch_data.to(device), batch_targets.to(device)
-                optimizer.zero_grad()
-                outputs = model(batch_data)
-                loss = criterion(outputs, batch_targets)
-                loss.backward()
-                optimizer.step()
-                running_loss += loss.item() * batch_data.size(0)
-            epoch_loss = running_loss / len(train_loader.dataset)
-            print(f"Epoch {epoch+1}/{num_epochs} – Training Loss: {epoch_loss:.4f}")
+        running_loss = 0.0
+        for data, targets in train_loader:
+            data, targets = data.to(device), targets.to(device)
+            optimizer.zero_grad()
+            outputs = model(data)
+            loss = criterion(outputs, targets)
+            loss.backward()
+            optimizer.step()
+            running_loss += loss.item() * data.size(0)
+        epoch_train_loss = running_loss / len(train_loader.dataset)
+        train_loss_history.append(epoch_train_loss)
         
-        # --- Evaluation on Test Data ---
         model.eval()
-        test_loss = 0.0
+        running_val_loss = 0.0
         with torch.no_grad():
-            for batch_data, batch_targets in test_loader:
-                batch_data, batch_targets = batch_data.to(device), batch_targets.to(device)
-                outputs = model(batch_data)
-                loss = criterion(outputs, batch_targets)
-                test_loss += loss.item() * batch_data.size(0)
-        test_loss /= len(test_loader.dataset)
-        print(f"Test Loss for subject {test_subject}: {test_loss:.4f}")
+            for data, targets in val_loader:
+                data, targets = data.to(device), targets.to(device)
+                outputs = model(data)
+                loss = criterion(outputs, targets)
+                running_val_loss += loss.item() * data.size(0)
+        epoch_val_loss = running_val_loss / len(val_loader.dataset)
+        val_loss_history.append(epoch_val_loss)
         
-        # For demonstration, we run one subject-out split.
-        break
+        scheduler.step()
+        print(f"Epoch [{epoch+1}/{num_epochs}] Train Loss: {epoch_train_loss:.4f} | Val Loss: {epoch_val_loss:.4f}")
+        
+        if epoch_val_loss < best_val_loss:
+            best_val_loss = epoch_val_loss
+            best_model_weights = copy.deepcopy(model.state_dict())
+    
+    model.load_state_dict(best_model_weights)
+    return model, train_loss_history, val_loss_history
+
+def test_model(model, device, test_loader, criterion):
+    model.eval()
+    running_test_loss = 0.0
+    with torch.no_grad():
+        for data, targets in test_loader:
+            data, targets = data.to(device), targets.to(device)
+            outputs = model(data)
+            loss = criterion(outputs, targets)
+            running_test_loss += loss.item() * data.size(0)
+    test_loss = running_test_loss / len(test_loader.dataset)
+    return test_loss
+
+#%% Main: One-Subject-Out Cross-Validation Setup and Training
+# Define your dataset root directory (update this path accordingly)
+dataset_root = r"dataset"  # e.g., "C:\path\to\dataset" or "./dataset"
+
+# Get list of subject folders (assumed to be immediate subfolders of dataset_root)
+all_subjects = [d for d in os.listdir(dataset_root) if os.path.isdir(os.path.join(dataset_root, d))]
+all_subjects.sort()
+print("Subjects found:", all_subjects)
+
+# For demonstration, we perform one subject-out split.
+# (In practice, you would loop over all subjects.)
+test_subject = all_subjects[0]
+train_subjects = all_subjects[1:]
+print(f"\nTraining on subjects: {train_subjects}")
+print(f"Testing on subject: {test_subject}")
+
+# Hyperparameters
+sequence_length = 128
+batch_size = 128
+num_epochs = 30
+learning_rate = 1e-3
+dropout_rate = 0.5
+
+# Create training and validation datasets (here we split train further into train/val)
+train_dataset_full = GaitPhaseDataset(root_dir=dataset_root, sequence_length=sequence_length, subjects=train_subjects)
+# Split training data into training and validation (e.g., 80/20 split)
+num_train = int(0.8 * len(train_dataset_full))
+num_val = len(train_dataset_full) - num_train
+train_dataset, val_dataset = torch.utils.data.random_split(train_dataset_full, [num_train, num_val])
+
+# Create test dataset (from test_subject)
+test_dataset = GaitPhaseDataset(root_dir=dataset_root, sequence_length=sequence_length, subjects=[test_subject])
+
+# DataLoaders
+train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True)
+val_loader   = DataLoader(val_dataset, batch_size=batch_size, shuffle=False)
+test_loader  = DataLoader(test_dataset, batch_size=batch_size, shuffle=False)
+
+# Initialize the model, loss function, optimizer, and scheduler
+model = BaselineGaitPhaseCNN(num_channels=12, sequence_length=sequence_length, output_dim=1, dropout_rate=dropout_rate)
+criterion = nn.MSELoss()
+optimizer = torch.optim.Adam(model.parameters(), lr=learning_rate)
+scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=10, gamma=0.5)
+
+# Device configuration
+device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+print("Running on device:", device)
+
+# Train the model
+model, train_loss_hist, val_loss_hist = train_model(model, device, train_loader, val_loader, criterion, optimizer, scheduler, num_epochs)
+
+# Plot training and validation loss
+plt.figure(figsize=(10,5))
+plt.plot(train_loss_hist, label='Train Loss')
+plt.plot(val_loss_hist, label='Val Loss')
+plt.xlabel('Epoch')
+plt.ylabel('MSE Loss')
+plt.title('Training and Validation Loss')
+plt.legend()
+plt.grid(True)
+plt.show()
+
+# Evaluate on test set
+test_loss = test_model(model, device, test_loader, criterion)
+print(f"Test Loss (MSE): {test_loss:.4f}")

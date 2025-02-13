@@ -1,27 +1,50 @@
-% Set the root directory here
-rootDir = 'dataset';
+% Root directory (adjust as needed)
+rootDir = 'data';
 
-% Recursively find all .mat files from the root directory down
-matFiles = dir(fullfile(rootDir, '**', '*.mat'));
+% Locate all .mat files in the treadmill/imu and treadmill/gcRight paths
+imuFiles = dir(fullfile(rootDir, '*', '*', 'treadmill', 'imu', '*.mat'));
+gcRightFiles = dir(fullfile(rootDir, '*', '*', 'treadmill', 'gcRight', '*.mat'));
+gcLeftFiles = dir(fullfile(rootDir, '*', '*', 'treadmill', 'gcLeft', '*.mat'));
+
+% Combine the two lists
+matFiles = [imuFiles; gcRightFiles; gcLeftFiles];
 
 for k = 1:numel(matFiles)
-    % Construct the full file path
+    % Construct the full path to the .mat file
     matFilePath = fullfile(matFiles(k).folder, matFiles(k).name);
     
-    % Load the .mat file
-    data = load(matFilePath);
+    % Load all variables from this .mat file into a struct
+    dataStruct = load(matFilePath);
     
-    % Check if the .mat file contains a variable named 'M'
-    if isfield(data, 'M')
-        % Construct .csv file path by replacing .mat with .csv
-        [folderPath, baseFileName, ~] = fileparts(matFilePath);
-        csvFilePath = fullfile(folderPath, [baseFileName, '.csv']);
+    % Retrieve the names of the variables in the .mat file
+    varNames = fieldnames(dataStruct);
+    
+    for v = 1:numel(varNames)
+        varData = dataStruct.(varNames{v});
         
-        % Write data.M to a CSV file
-        csvwrite(csvFilePath, data.M);
+        if istable(varData)
+            % Build output filename
+            [folderPath, baseName, ~] = fileparts(matFilePath);
+            csvName = sprintf('%s_%s.csv', baseName, varNames{v});
+            csvPath = fullfile(folderPath, csvName);
+            
+            writetable(varData, csvPath);
+            fprintf('Converted table: %s (variable "%s") -> %s\n', ...
+                matFilePath, varNames{v}, csvPath);
         
-        fprintf('Converted: %s -> %s\n', matFilePath, csvFilePath);
-    else
-        warning('Variable "M" not found in %s. Skipping...', matFilePath);
+        elseif isnumeric(varData) && ismatrix(varData)
+            % Build output filename
+            [folderPath, baseName, ~] = fileparts(matFilePath);
+            csvName = sprintf('%s_%s.csv', baseName, varNames{v});
+            csvPath = fullfile(folderPath, csvName);
+        
+            writematrix(varData, csvPath);
+            fprintf('Converted numeric matrix: %s (variable "%s") -> %s\n', ...
+                matFilePath, varNames{v}, csvPath);
+        
+        else
+            fprintf('Skipping variable "%s" in %s (not numeric 2D or table)\n', ...
+                varNames{v}, matFiles(k).name);
+        end
     end
 end

@@ -4,3 +4,19 @@ test_dataset
 
 visualize the results by plotting gait profiles of data for each stride, averaged over all strides for each subject, and averaged over subjects.
 
+Subjects found: ['AB07', 'AB15', 'AB16', 'AB28']
+
+--- One-Subject-Out Split ---
+Training on subjects: ['AB15', 'AB16', 'AB28']
+Testing on subject: AB07
+Epoch 1/5 – Training Loss: 0.7260
+Epoch 2/5 – Training Loss: 0.2916
+Epoch 3/5 – Training Loss: 0.1817
+Epoch 4/5 – Training Loss: 0.5342
+Epoch 5/5 – Training Loss: 0.1626
+Test Loss for subject AB07: 0.2268
+
+
+
+sequence_length = 200
+dropout rate = 0.5
