@@ -38,11 +38,22 @@ class GaitPhaseDataset(Dataset):
         search_path = os.path.join(root_dir, '*', '*', 'treadmill', 'imu', '*.csv')
         self.imu_files = glob.glob(search_path, recursive=True)
         if subjects is not None:
-            # Assume that the subject folder is the first folder under root_dir.
-            self.imu_files = [f for f in self.imu_files if os.path.basename(os.path.dirname(os.path.dirname(os.path.dirname(f)))) in subjects]
-        
+            # Filter files based on subject IDs
+            filtered_files = []
+            for subject in subjects:
+                subject_path = os.path.join(root_dir, subject, '*', 'treadmill', 'imu', '*.csv')
+                filtered_files.extend(glob.glob(subject_path))
+                print(f"Before filtering - Number of files: {len(self.imu_files)}")
+                print(f"Filtering for subject: {subject}")
+            self.imu_files = filtered_files
+            print(f"After filtering - Number of files: {len(self.imu_files)}")
+            print("Sample paths:")
+            for f in self.imu_files[:2]:  # Print first 2 paths as examples
+                print(f"- {f}")
+                print(f"  Subject: {os.path.basename(os.path.dirname(os.path.dirname(os.path.dirname(f))))}")
         if len(self.imu_files) == 0:
             raise RuntimeError("No IMU files found. Please check your dataset directory and folder structure.")
+
     
     def __len__(self):
         return len(self.imu_files)
@@ -207,16 +218,15 @@ def test_model(model, device, test_loader, criterion):
     return test_loss
 
 #%% Main: One-Subject-Out Cross-Validation Setup and Training
-# Define your dataset root directory (update this path accordingly)
-dataset_root = r"dataset"  # e.g., "C:\path\to\dataset" or "./dataset"
+# Define dataset root directory
+dataset_root = r"data"  # e.g., "C:\path\to\dataset" or "./dataset"
 
-# Get list of subject folders (assumed to be immediate subfolders of dataset_root)
+# Get list of subject folders
 all_subjects = [d for d in os.listdir(dataset_root) if os.path.isdir(os.path.join(dataset_root, d))]
 all_subjects.sort()
 print("Subjects found:", all_subjects)
 
-# For demonstration, we perform one subject-out split.
-# (In practice, you would loop over all subjects.)
+# perform one subject-out split. #TODO: # loop over all subjects
 test_subject = all_subjects[0]
 train_subjects = all_subjects[1:]
 print(f"\nTraining on subjects: {train_subjects}")
