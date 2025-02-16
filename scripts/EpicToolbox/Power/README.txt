@@ -1,1 +1,0 @@
-Functions to compute the power and metabolics estimation

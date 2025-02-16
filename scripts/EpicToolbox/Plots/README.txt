@@ -1,1 +1,0 @@
-Functions to make representative plots of locomotion
