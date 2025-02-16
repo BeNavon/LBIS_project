@@ -92,6 +92,11 @@ class GaitPhaseDataset(Dataset):
         imu_selected = imu_selected[:min_length, :]
         gcRight_data = gcRight_data[:min_length, :]
         
+        # Randomly extract a window of fixed length.
+        if min_length > self.sequence_length:
+            start_idx = random.randint(0, min_length - self.sequence_length)
+        else:
+            start_idx = 0  # Alternatively, pad shorter sequences.
         end_idx = start_idx + self.sequence_length
         imu_window = imu_selected[start_idx:end_idx, :]  # (sequence_length, 12)
         
@@ -239,7 +244,7 @@ train_dataset_full = GaitPhaseDataset(root_dir=dataset_root, sequence_length=seq
 # Split training data into training and validation (e.g., 80/20 split)
 num_train = int(0.8 * len(train_dataset_full))
 num_val = len(train_dataset_full) - num_train
-train_dataset, val_dataset = torch.utils.data(train_dataset_full, [num_train, num_val])
+train_dataset, val_dataset = torch.utils.data.random_split(train_dataset_full, [num_train, num_val])
 
 # Create test dataset (from test_subject)
 test_dataset = GaitPhaseDataset(root_dir=dataset_root, sequence_length=sequence_length, subjects=[test_subject])
