@@ -1,13 +1,12 @@
 % Root directory (adjust as needed)
-rootDir = 'data';
+rootDir = 'dataset';
 
 % Locate all .mat files in the treadmill/imu and treadmill/gcRight paths
-imuFiles = dir(fullfile(rootDir, '*', '*', 'treadmill', 'imu', '*.mat'));
-gcRightFiles = dir(fullfile(rootDir, '*', '*', 'treadmill', 'gcRight', '*.mat'));
-gcLeftFiles = dir(fullfile(rootDir, '*', '*', 'treadmill', 'gcLeft', '*.mat'));
+imuFiles = dir(fullfile(rootDir, '*', 'treadmill', 'imu', '*.mat'));
+gcRightFiles = dir(fullfile(rootDir, '*', 'treadmill', 'gcRight', '*.mat'));
 
 % Combine the two lists
-matFiles = [imuFiles; gcRightFiles; gcLeftFiles];
+matFiles = [imuFiles; gcRightFiles];
 
 for k = 1:numel(matFiles)
     % Construct the full path to the .mat file
