@@ -1,4 +1,6 @@
 dataset/
 .venv
-**/*.npy
+*.npy
 archive/
+.gitignore
+npys/
