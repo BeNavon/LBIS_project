@@ -1,0 +1,58 @@
+{
+    "scenario_1": {
+        "is_filter": true,
+        "filter_type": "causal",
+        "is_normalize": true,
+        "window_size": 200,
+        "overlap": 100
+    },
+    "scenario_2": {
+        "is_filter": true,
+        "filter_type": "causal",
+        "is_normalize": false,
+        "window_size": 200,
+        "overlap": 100
+    },
+    "scenario_3": {
+        "is_filter": true,
+        "filter_type": "non-causal",
+        "is_normalize": true,
+        "window_size": 200,
+        "overlap": 100
+    },
+    "scenario_4": {
+        "is_filter": true,
+        "filter_type": "causal",
+        "is_normalize": true,
+        "window_size": 100,
+        "overlap": 50
+    },
+    "scenario_5": {
+        "is_filter": true,
+        "filter_type": "causal",
+        "is_normalize": true,
+        "window_size": 200,
+        "overlap": 50
+    },
+    "scenario_6": {
+        "is_filter": true,
+        "filter_type": "causal",
+        "is_normalize": true,
+        "window_size": 100,
+        "overlap": 25
+    },
+    "scenario_7": {
+        "is_filter": false,
+        "filter_type": "irrelevant",
+        "is_normalize": true,
+        "window_size": 200,
+        "overlap": 100
+    },
+    "scenario_8": {
+        "is_filter": false,
+        "filter_type": "irrelevant",
+        "is_normalize": false,
+        "window_size": 200,
+        "overlap": 100
+    }
+}
