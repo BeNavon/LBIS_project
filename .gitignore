@@ -6,7 +6,7 @@ archive/
 npys/
 
 *.npy
-
+*.pyc
 preprocessing/y_train.npy
 preprocessing/y_test.npy
 preprocessing/X_train.npy
